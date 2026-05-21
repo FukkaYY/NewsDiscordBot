@@ -5,3 +5,4 @@
 - プログラミング言語:python
 - 使用AI:Google gemini(api)
 - discord bot
+- データベース:SQLite
