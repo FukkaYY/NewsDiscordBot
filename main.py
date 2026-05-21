@@ -12,6 +12,7 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 import google.generativeai as genai
 import aiosqlite
+import aiohttp
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -24,7 +25,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 # Initialize Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-pro')
+# Enable Google Search grounding using the latest flagship model
+model = genai.GenerativeModel(
+    model_name='gemini-3.5-flash',
+    tools=[{"google_search_retrieval": {}}]
+)
 
 # Database file
 DB_FILE = "news_bot.db"
@@ -65,7 +70,7 @@ class NewsBot(commands.Bot):
     @tasks.loop(time=[datetime.time(hour=9, minute=0, tzinfo=ZoneInfo("Asia/Tokyo")), 
                       datetime.time(hour=17, minute=0, tzinfo=ZoneInfo("Asia/Tokyo"))])
     async def news_task(self):
-        logger.info(f"Scheduled news delivery triggered.")
+        logger.info("Scheduled news delivery triggered.")
         await self.send_news_to_all_guilds()
 
     async def send_news_to_all_guilds(self):
@@ -98,21 +103,28 @@ class NewsBot(commands.Bot):
                 logger.warning(f"Could not find channel {channel_id} for guild {guild_id}")
 
     async def fetch_news_with_gemini(self) -> List[Dict[str, str]]:
-        prompt = """
+        today = datetime.datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y年%m月%d日")
+        prompt = f"""
+        今日は {today} です。
         今日の最新ニュースを5件ピックアップしてください。
-        ジャンルはランダムに選んでください。
+        
+        【重要：検証ステップ】
+        選んだ各ニュースについて、以下の2点を厳格に確認してください：
+        1. そのニュースが本当に {today} のものであること。
+        2. そのURLが現在実在し、正しくアクセスできること。
+        
+        もし確信が持てない場合は、別の確実なニュースを探してください。
+        
         出力は必ず以下のJSON形式で返してください。
         [
-            {"title": "ニュースのタイトル1", "url": "ニュースのURL1"},
-            {"title": "ニュースのタイトル2", "url": "ニュース the URL2"},
+            {{"title": "ニュースのタイトル1", "url": "ニュースのURL1"}},
+            {{"title": "ニュースのタイトル2", "url": "ニュースのURL2"}},
             ...
         ]
-        URLは実在する正しいものを答えてください。
-        過去に送ったものと重複しないように、新しいニュースを優先してください。
         """
         
         try:
-            # Get already sent URLs to exclude them
+            # Get already sent URLs
             async with aiosqlite.connect(DB_FILE) as db:
                 async with db.execute("SELECT url FROM news_history ORDER BY sent_at DESC LIMIT 100") as cursor:
                     sent_urls = [row[0] for row in await cursor.fetchall()]
@@ -121,22 +133,51 @@ class NewsBot(commands.Bot):
                 prompt += f"\n以下のURLは既に送信済みなので除外してください:\n" + "\n".join(sent_urls)
 
             response = model.generate_content(prompt)
-            # Simple JSON extraction (Gemini often wraps in ```json ... ```)
+            if not response or not response.text:
+                logger.error("Gemini returned an empty response.")
+                return []
+
             text = response.text
+            logger.debug(f"Raw Gemini response: {text}")
+            
+            # Extract JSON block
             if "```json" in text:
                 text = text.split("```json")[1].split("```")[0].strip()
             elif "```" in text:
                 text = text.split("```")[1].split("```")[0].strip()
             
-            items = json.loads(text)
+            try:
+                items = json.loads(text)
+            except json.JSONDecodeError as je:
+                logger.error(f"Failed to decode JSON from Gemini: {je}. Raw text: {text}")
+                return []
             
-            # Filter duplicates just in case and save to history
+            # URL Validation Phase
+            verified_items = []
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+            async with aiohttp.ClientSession(headers=headers) as session:
+                for item in items:
+                    if not isinstance(item, dict) or 'url' not in item or 'title' not in item:
+                        continue
+                    if item['url'] in sent_urls:
+                        continue
+                        
+                    try:
+                        async with session.get(item['url'], timeout=5) as resp:
+                            if resp.status == 200:
+                                verified_items.append(item)
+                                logger.info(f"Verified URL: {item['url']}")
+                            else:
+                                logger.warning(f"Invalid URL (Status {resp.status}): {item['url']}")
+                    except Exception as e:
+                        logger.warning(f"Could not verify URL {item['url']}: {e}")
+            
+            # Save to history and return
             new_items = []
             async with aiosqlite.connect(DB_FILE) as db:
-                for item in items:
-                    if item['url'] not in sent_urls:
-                        await db.execute("INSERT OR IGNORE INTO news_history (url) VALUES (?)", (item['url'],))
-                        new_items.append(item)
+                for item in verified_items:
+                    await db.execute("INSERT OR IGNORE INTO news_history (url) VALUES (?)", (item['url'],))
+                    new_items.append(item)
                     if len(new_items) >= 5:
                         break
                 await db.commit()
