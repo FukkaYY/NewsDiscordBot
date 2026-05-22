@@ -3,4 +3,4 @@ google-generativeai
 python-dotenv
 aiosqlite
 aiohttp
-duckduckgo_search
+ddgs
