@@ -45,7 +45,18 @@ class RatingView(discord.ui.View):
                 (self.url, interaction.user.id, rating)
             )
             await db.commit()
-        await interaction.response.send_message(f"評価（{rating}/5）を受け付けました。", ephemeral=True)
+        
+        # Update button styles to show selection and disable them
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+                if child.label == str(rating):
+                    child.style = discord.ButtonStyle.green
+                    child.label = f"評価: {rating}"
+                else:
+                    child.style = discord.ButtonStyle.gray
+        
+        await interaction.response.edit_message(view=self)
 
     @discord.ui.button(label="1", style=discord.ButtonStyle.gray)
     async def rate_1(self, interaction: discord.Interaction, button: discord.ui.Button):
