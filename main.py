@@ -54,6 +54,13 @@ class NewsBot(commands.Bot):
                     sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS news_genres (
+                    url TEXT,
+                    genre TEXT,
+                    FOREIGN KEY (url) REFERENCES news_history (url)
+                )
+            """)
             await db.commit()
         
         # Sync slash commands
@@ -65,6 +72,17 @@ class NewsBot(commands.Bot):
 
     async def on_ready(self):
         logger.info(f"Logged in as {self.user} (ID: {self.user.id})")
+
+    def get_genre_list(self) -> str:
+        try:
+            with open("genres.md", "r", encoding="utf-8") as f:
+                lines = f.readlines()
+                # Extract bullet points (e.g., "- 政治 (Politics)")
+                genres = [line.strip("- \n") for line in lines if line.strip().startswith("-")]
+                return ", ".join(genres)
+        except Exception as e:
+            logger.error(f"Error reading genres.md: {e}")
+            return "政治, 経済, 社会, 国際, テクノロジー, 科学, ビジネス, エンタメ, スポーツ"
 
     @tasks.loop(time=[datetime.time(hour=9, minute=0, tzinfo=ZoneInfo("Asia/Tokyo")), 
                       datetime.time(hour=17, minute=0, tzinfo=ZoneInfo("Asia/Tokyo"))])
@@ -90,19 +108,23 @@ class NewsBot(commands.Bot):
             channel = self.get_channel(channel_id)
             if channel:
                 for item in news_items:
+                    genres_str = ", ".join(item.get('genres', []))
                     embed = discord.Embed(
                         title=item['title'],
                         url=item['url'],
                         description=item.get('summary', "今日のニュースです。"),
                         color=discord.Color.blue()
                     )
+                    if genres_str:
+                        embed.add_field(name="ジャンル", value=genres_str, inline=False)
                     await channel.send(embed=embed)
                 logger.info(f"Sent news to guild {guild_id}, channel {channel_id}")
             else:
                 logger.warning(f"Could not find channel {channel_id} for guild {guild_id}")
 
-    async def fetch_news_with_gemini(self) -> List[Dict[str, str]]:
+    async def fetch_news_with_gemini(self) -> List[Dict[str, Any]]:
         today = datetime.datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y年%m月%d日")
+        genre_list = self.get_genre_list()
         
         # Step 1: Fetch news using DDGS
         logger.info("Fetching news from DuckDuckGo...")
@@ -157,18 +179,27 @@ class NewsBot(commands.Bot):
 
         prompt = f"""
         今日は {today} です。
-        以下のニュースリストから、重要度が高く、興味深い最新ニュースを【必ず5件】厳選し、日本語で要約してください。
+        以下のニュースリストから、重要度が高く、興味深い最新ニュースを【必ず5件】厳選し、日本語で要約とジャンル付与を行ってください。
         
         【ニュースリスト】
         {json.dumps(filtered_raw_news, ensure_ascii=False, indent=2)}
         
+        【利用可能なジャンル】
+        {genre_list}
+        
         【条件】
         1. 重複がなく、最新のニュースとして相応しいものを【5件】選んでください。
         2. 各ニュースについて、30〜50文字程度の短い要約（summary）を作成してください。
-        3. 出力は必ず以下のJSON形式のみで返してください。
+        3. 各ニュースに対し、上記の【利用可能なジャンル】から最も適切なものを【最大3つ】選び、リスト（genres）として含めてください。
+        4. 出力は必ず以下のJSON形式のみで返してください。
         
         [
-            {{"title": "ニュースタイトル", "url": "URL", "summary": "短い要約"}},
+            {{
+                "title": "ニュースタイトル", 
+                "url": "URL", 
+                "summary": "短い要約",
+                "genres": ["ジャンル1", "ジャンル2"]
+            }},
             ...
         ]
         """
@@ -195,6 +226,10 @@ class NewsBot(commands.Bot):
                     if item['url'] in sent_urls:
                         continue
                     await db.execute("INSERT OR IGNORE INTO news_history (url) VALUES (?)", (item['url'],))
+                    # Save genres to news_genres table
+                    for genre in item.get('genres', []):
+                        await db.execute("INSERT INTO news_genres (url, genre) VALUES (?, ?)", (item['url'], genre))
+                    
                     verified_items.append(item)
                     if len(verified_items) >= 5:
                         break
