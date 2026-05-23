@@ -16,3 +16,6 @@
 - 環境 (Environment)
 - 教育 (Education)
 - ペット (pet)
+- 旅行 (travel)
+- 酒 (sake)
+- 犯罪 (crime)
