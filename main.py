@@ -147,6 +147,12 @@ class NewsBot(commands.Bot):
         await self.send_news_to_all_guilds()
 
     async def get_genre_scores(self) -> Dict[str, float]:
+        # Get all genres first
+        all_genres_str = self.get_genre_list()
+        all_genres = [g.strip() for g in all_genres_str.split(",")]
+        # Initialize with default score of 3.0
+        scores = {genre: 3.0 for genre in all_genres}
+        
         async with aiosqlite.connect(DB_FILE) as db:
             # Weighted average calculation: Weight = 1 / (days_passed + 1)
             query = """
@@ -161,7 +167,7 @@ class NewsBot(commands.Bot):
                 rows = await cursor.fetchall()
             
             if not rows:
-                return {}
+                return scores
             
             genre_stats = {}
             for genre, rating, days_passed in rows:
@@ -171,7 +177,11 @@ class NewsBot(commands.Bot):
                 genre_stats[genre]['weighted_sum'] += rating * weight
                 genre_stats[genre]['sum_weights'] += weight
             
-            return {genre: stats['weighted_sum'] / stats['sum_weights'] for genre, stats in genre_stats.items()}
+            for genre, stats in genre_stats.items():
+                if genre in scores:
+                    scores[genre] = stats['weighted_sum'] / stats['sum_weights']
+            
+            return scores
 
     async def send_news_to_all_guilds(self):
         async with aiosqlite.connect(DB_FILE) as db:
