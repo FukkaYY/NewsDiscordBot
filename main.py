@@ -149,7 +149,8 @@ class NewsBot(commands.Bot):
     async def get_genre_scores(self) -> Dict[str, float]:
         # Get all genres first
         all_genres_str = self.get_genre_list()
-        all_genres = [g.strip() for g in all_genres_str.split(",")]
+        # Ensure we strip whitespace from each genre name
+        all_genres = [g.strip() for g in all_genres_str.split(",") if g.strip()]
         # Initialize with default score of 3.0
         scores = {genre: 3.0 for genre in all_genres}
         
@@ -171,6 +172,8 @@ class NewsBot(commands.Bot):
             
             genre_stats = {}
             for genre, rating, days_passed in rows:
+                # Clean the genre name from DB just in case
+                genre = genre.strip()
                 weight = 1.0 / (max(0, days_passed) + 1.0)
                 if genre not in genre_stats:
                     genre_stats[genre] = {'weighted_sum': 0.0, 'sum_weights': 0.0}
@@ -178,8 +181,8 @@ class NewsBot(commands.Bot):
                 genre_stats[genre]['sum_weights'] += weight
             
             for genre, stats in genre_stats.items():
-                if genre in scores:
-                    scores[genre] = stats['weighted_sum'] / stats['sum_weights']
+                # Update existing score or add new genre from DB
+                scores[genre] = stats['weighted_sum'] / stats['sum_weights']
             
             return scores
 
