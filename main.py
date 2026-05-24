@@ -145,7 +145,11 @@ class NewsBot(commands.Bot):
                       datetime.time(hour=17, minute=0, tzinfo=ZoneInfo("Asia/Tokyo"))])
     async def news_task(self):
         logger.info("Scheduled news delivery triggered.")
-        await self.send_news_to_all_guilds()
+        try:
+            await self.send_news_to_all_guilds()
+            logger.info("Scheduled news delivery completed successfully.")
+        except Exception as e:
+            logger.error(f"Error in scheduled news task: {e}", exc_info=True)
 
     async def get_genre_scores(self) -> Dict[str, float]:
         # Get all genres first
@@ -155,39 +159,46 @@ class NewsBot(commands.Bot):
         # Initialize with default score of 3.0
         scores = {genre: 3.0 for genre in all_genres}
         
-        async with aiosqlite.connect(DB_FILE) as db:
-            # Weighted average calculation: Weight = 1 / (days_passed + 1)
-            query = """
-                SELECT 
-                    ng.genre,
-                    nr.rating,
-                    julianday('now') - julianday(nr.created_at) as days_passed
-                FROM news_ratings nr
-                JOIN news_genres ng ON nr.url = ng.url
-            """
-            async with db.execute(query) as cursor:
-                rows = await cursor.fetchall()
-            
-            if not rows:
-                return scores
-            
-            genre_stats = {}
-            for genre, rating, days_passed in rows:
-                # Clean the genre name from DB just in case
-                genre = genre.strip()
-                weight = 1.0 / (max(0, days_passed) + 1.0)
-                if genre not in genre_stats:
-                    genre_stats[genre] = {'weighted_sum': 0.0, 'sum_weights': 0.0}
-                genre_stats[genre]['weighted_sum'] += rating * weight
-                genre_stats[genre]['sum_weights'] += weight
-            
-            for genre, stats in genre_stats.items():
-                # Update existing score or add new genre from DB
-                scores[genre] = stats['weighted_sum'] / stats['sum_weights']
-            
-            return scores
+        try:
+            async with aiosqlite.connect(DB_FILE) as db:
+                # Weighted average calculation: Weight = 1 / (days_passed + 1)
+                query = """
+                    SELECT 
+                        ng.genre,
+                        nr.rating,
+                        julianday('now') - julianday(nr.created_at) as days_passed
+                    FROM news_ratings nr
+                    JOIN news_genres ng ON nr.url = ng.url
+                """
+                async with db.execute(query) as cursor:
+                    rows = await cursor.fetchall()
+                
+                if not rows:
+                    return scores
+                
+                genre_stats = {}
+                for genre, rating, days_passed in rows:
+                    if genre is None:
+                        continue
+                    # Clean the genre name from DB just in case
+                    genre = genre.strip()
+                    weight = 1.0 / (max(0, days_passed) + 1.0)
+                    if genre not in genre_stats:
+                        genre_stats[genre] = {'weighted_sum': 0.0, 'sum_weights': 0.0}
+                    genre_stats[genre]['weighted_sum'] += rating * weight
+                    genre_stats[genre]['sum_weights'] += weight
+                
+                for genre, stats in genre_stats.items():
+                    # Update existing score or add new genre from DB
+                    if stats['sum_weights'] > 0:
+                        scores[genre] = stats['weighted_sum'] / stats['sum_weights']
+        except Exception as e:
+            logger.error(f"Error in get_genre_scores: {e}")
+        
+        return scores
 
     async def send_news_to_all_guilds(self):
+        logger.info("Starting send_news_to_all_guilds...")
         async with aiosqlite.connect(DB_FILE) as db:
             async with db.execute("SELECT guild_id, channel_id FROM config") as cursor:
                 configs = await cursor.fetchall()
@@ -199,11 +210,19 @@ class NewsBot(commands.Bot):
         genre_scores = await self.get_genre_scores()
         news_items = await self.fetch_news_with_gemini(genre_scores)
         if not news_items:
-            logger.error("Failed to fetch news items.")
+            logger.warning("No news items to send (either fetch failed or no new items).")
             return
 
         for guild_id, channel_id in configs:
-            channel = self.get_channel(channel_id)
+            channel = self.bot_get_channel(channel_id)
+            if not channel:
+                try:
+                    logger.info(f"Channel {channel_id} not in cache, fetching...")
+                    channel = await self.fetch_channel(channel_id)
+                except Exception as e:
+                    logger.warning(f"Could not fetch channel {channel_id}: {e}")
+                    continue
+
             if channel:
                 for item in news_items:
                     genres_str = ", ".join(item.get('genres', []))
@@ -222,6 +241,9 @@ class NewsBot(commands.Bot):
                 logger.info(f"Sent news to guild {guild_id}, channel {channel_id}")
             else:
                 logger.warning(f"Could not find channel {channel_id} for guild {guild_id}")
+
+    def bot_get_channel(self, channel_id):
+        return self.get_channel(channel_id)
 
     async def fetch_news_with_gemini(self, genre_scores: Dict[str, float] = None) -> List[Dict[str, Any]]:
         today = datetime.datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y年%m月%d日")
@@ -330,18 +352,36 @@ class NewsBot(commands.Bot):
             elif "```" in text:
                 text = text.split("```")[1].split("```")[0].strip()
             
-            items = json.loads(text)
+            try:
+                items = json.loads(text)
+            except json.JSONDecodeError as je:
+                logger.error(f"Failed to parse Gemini response as JSON: {je}. Response text: {text}")
+                return []
+
+            if not isinstance(items, list):
+                logger.error(f"Gemini returned JSON that is not a list: {type(items)}")
+                return []
             
             # Save to history and return
             verified_items = []
             async with aiosqlite.connect(DB_FILE) as db:
                 for item in items:
+                    if not isinstance(item, dict) or 'url' not in item or 'title' not in item:
+                        logger.warning(f"Skipping invalid item from Gemini: {item}")
+                        continue
+                    
                     if item['url'] in sent_urls:
                         continue
+                    
+                    # Ensure title is not None
+                    if item['title'] is None:
+                        item['title'] = "タイトルなし"
+
                     await db.execute("INSERT OR IGNORE INTO news_history (url, title) VALUES (?, ?)", (item['url'], item['title']))
                     # Save genres to news_genres table
                     for genre in item.get('genres', []):
-                        await db.execute("INSERT INTO news_genres (url, genre) VALUES (?, ?)", (item['url'], genre))
+                        if genre:
+                            await db.execute("INSERT INTO news_genres (url, genre) VALUES (?, ?)", (item['url'], genre))
                     
                     verified_items.append(item)
                     if len(verified_items) >= 5:

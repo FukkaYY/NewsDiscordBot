@@ -19,3 +19,4 @@
 - 旅行 (travel)
 - 酒 (sake)
 - 犯罪 (crime)
+- 訃報 (death)
