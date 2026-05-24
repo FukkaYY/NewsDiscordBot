@@ -46,15 +46,16 @@ class RatingView(discord.ui.View):
             )
             await db.commit()
         
-        # Update button styles to show selection and disable them
+        # Update button styles to show selection
         for child in self.children:
             if isinstance(child, discord.ui.Button):
-                child.disabled = True
-                if child.label == str(rating):
+                if child.label == str(rating) or child.label == f"評価: {rating}":
                     child.style = discord.ButtonStyle.green
                     child.label = f"評価: {rating}"
                 else:
                     child.style = discord.ButtonStyle.gray
+                    if child.label and child.label.startswith("評価: "):
+                        child.label = child.label.replace("評価: ", "")
         
         await interaction.response.edit_message(view=self)
 
