@@ -97,6 +97,7 @@ class NewsBot(commands.Bot):
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS news_history (
                     url TEXT PRIMARY KEY,
+                    title TEXT,
                     sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             """)
@@ -337,7 +338,7 @@ class NewsBot(commands.Bot):
                 for item in items:
                     if item['url'] in sent_urls:
                         continue
-                    await db.execute("INSERT OR IGNORE INTO news_history (url) VALUES (?)", (item['url'],))
+                    await db.execute("INSERT OR IGNORE INTO news_history (url, title) VALUES (?, ?)", (item['url'], item['title']))
                     # Save genres to news_genres table
                     for genre in item.get('genres', []):
                         await db.execute("INSERT INTO news_genres (url, genre) VALUES (?, ?)", (item['url'], genre))
@@ -383,6 +384,138 @@ async def interest(interaction: discord.Interaction):
     )
     
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+@bot.tree.command(name="genre_search", description="ジャンルを指定してニュースを検索します")
+@app_commands.describe(genre="検索したいジャンル")
+async def genre_search(interaction: discord.Interaction, genre: str):
+    await interaction.response.defer()
+    
+    # 1. Search from history (DB)
+    history_results = []
+    async with aiosqlite.connect(DB_FILE) as db:
+        query = """
+            SELECT nh.title, nh.url, nh.sent_at
+            FROM news_history nh
+            JOIN news_genres ng ON nh.url = ng.url
+            WHERE ng.genre = ?
+            ORDER BY nh.sent_at DESC
+            LIMIT 3
+        """
+        async with db.execute(query, (genre,)) as cursor:
+            history_results = await cursor.fetchall()
+
+    # 2. Search latest news (Web + Gemini)
+    latest_results = []
+    genre_list = bot.get_genre_list()
+    try:
+        with DDGS() as ddgs:
+            search_query = f"{genre} 最新ニュース"
+            results = ddgs.text(query=search_query, region="jp-jp", safesearch="on", timelimit="d", max_results=10)
+            raw_web_news = [{"title": r.get("body"), "url": r.get("href"), "original_title": r.get("title")} for r in results]
+
+        if raw_web_news:
+            prompt = f"""
+            あなたはニュース選別アシスタントです。
+            以下のニュースリストから、ジャンル「{genre}」に最も合致する重要なニュースを最大3件選び、日本語で要約してください。
+            また、各ニュースに対して、以下の【利用可能なジャンル】から最も適切なものを【最大3つ】選び、リスト（genres）として含めてください。
+            
+            【利用可能なジャンル】
+            {genre_list}
+
+            【ニュースリスト】
+            {json.dumps(raw_web_news, ensure_ascii=False, indent=2)}
+            
+            【出力形式】必ず以下のJSON形式で返してください。
+            [
+                {{
+                    "title": "ニュースタイトル",
+                    "url": "URL",
+                    "summary": "短い要約",
+                    "genres": ["ジャンル1", "ジャンル2"]
+                }},
+                ...
+            ]
+            """
+            response = model.generate_content(prompt)
+            if response and response.text:
+                text = response.text
+                if "```json" in text:
+                    text = text.split("```json")[1].split("```")[0].strip()
+                elif "```" in text:
+                    text = text.split("```")[1].split("```")[0].strip()
+                latest_results = json.loads(text)
+    except Exception as e:
+        logger.error(f"Error in latest news search: {e}")
+
+    # 3. Create Embed for history
+    history_embed = discord.Embed(
+        title=f"🔍 「{genre}」の検索結果（履歴）",
+        color=discord.Color.blue(),
+        timestamp=datetime.datetime.now()
+    )
+
+    history_text = ""
+    if history_results:
+        for title, url, sent_at in history_results:
+            # Handle potential None title
+            display_title = title if title else "タイトルなし"
+            history_text += f"- [{display_title}]({url}) ({sent_at[:10]})\n"
+    else:
+        history_text = "過去の配信履歴に該当するニュースはありません。"
+    history_embed.add_field(name="📌 過去の配信履歴", value=history_text, inline=False)
+
+    await interaction.followup.send(embed=history_embed)
+
+    # 4. Save and Send Latest News with RatingView
+    if latest_results:
+        async with aiosqlite.connect(DB_FILE) as db:
+            for item in latest_results:
+                # Save to history
+                await db.execute("INSERT OR IGNORE INTO news_history (url, title) VALUES (?, ?)", (item['url'], item['title']))
+                
+                # Save all identified genres to news_genres table
+                item_genres = item.get('genres', [])
+                # Ensure the searched genre is included if not already there
+                if genre not in item_genres:
+                    item_genres.append(genre)
+                
+                for g_name in item_genres:
+                    await db.execute("INSERT OR IGNORE INTO news_genres (url, genre) VALUES (?, ?)", (item['url'], g_name.strip()))
+                
+                await db.commit()
+
+                # Send each latest news as a separate message with RatingView
+                latest_embed = discord.Embed(
+                    title=item['title'],
+                    url=item['url'],
+                    description=item['summary'],
+                    color=discord.Color.blue()
+                )
+                genres_str = ", ".join(item_genres)
+                latest_embed.set_footer(text=f"ジャンル: {genres_str} (最新検索)")
+                
+                view = RatingView(item['url'])
+                await interaction.followup.send(embed=latest_embed, view=view)
+    else:
+        await interaction.followup.send(f"「{genre}」の最新ニュースは見つかりませんでした。")
+
+@genre_search.autocomplete('genre')
+async def genre_search_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> List[app_commands.Choice[str]]:
+    # Get all available genres
+    try:
+        with open("genres.md", "r", encoding="utf-8") as f:
+            lines = f.readlines()
+            genres = [line.strip("- \n") for line in lines if line.strip().startswith("-")]
+    except:
+        genres = ["政治", "経済", "社会", "国際", "テクノロジー", "科学", "ビジネス", "エンタメ", "スポーツ"]
+    
+    return [
+        app_commands.Choice(name=genre, value=genre)
+        for genre in genres if current.lower() in genre.lower()
+    ][:25]
 
 @bot.tree.command(name="setup", description="ニュースを受信するチャンネルを設定します（管理者のみ）")
 @app_commands.checks.has_permissions(administrator=True)
