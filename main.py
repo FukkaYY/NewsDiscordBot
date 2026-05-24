@@ -351,6 +351,36 @@ class NewsBot(commands.Bot):
 
 bot = NewsBot()
 
+@bot.tree.command(name="interest", description="現在のジャンル別関心度を表示します")
+async def interest(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    
+    genre_scores = await bot.get_genre_scores()
+    
+    if not genre_scores:
+        await interaction.followup.send("関心度データがまだありません。", ephemeral=True)
+        return
+
+    # Sort genres by score descending
+    sorted_genres = sorted(genre_scores.items(), key=lambda x: x[1], reverse=True)
+    
+    description = "【ユーザーの現在の関心度（5点満点）】\n"
+    description += "※未評価のジャンルはデフォルトで3.00となります。\n\n"
+    
+    for genre, score in sorted_genres:
+        # Create a visual bar [■■■□□]
+        filled_blocks = min(5, max(0, int(round(score))))
+        bar = "■" * filled_blocks + "□" * (5 - filled_blocks)
+        description += f"- {genre}: `[{bar}]` **{score:.2f}**\n"
+    
+    embed = discord.Embed(
+        title="📊 ジャンル別関心度",
+        description=description,
+        color=discord.Color.green()
+    )
+    
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
 @bot.tree.command(name="setup", description="ニュースを受信するチャンネルを設定します（管理者のみ）")
 @app_commands.checks.has_permissions(administrator=True)
 async def setup(interaction: discord.Interaction):
