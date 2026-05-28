@@ -340,7 +340,7 @@ class NewsBot(commands.Bot):
         """
         
         try:
-            response = model.generate_content(prompt)
+            response = await model.generate_content_async(prompt)
             if not response or not response.text:
                 logger.error("Gemini returned an empty response.")
                 return []
@@ -501,7 +501,7 @@ async def genre_search(interaction: discord.Interaction, genre: str):
                 ...
             ]
             """
-            response = model.generate_content(prompt)
+            response = await model.generate_content_async(prompt)
             if response and response.text:
                 text = response.text
                 if "```json" in text:
@@ -603,6 +603,138 @@ async def test_news(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await bot.send_news_to_all_guilds()
     await interaction.followup.send("ニュース配信テストを完了しました。", ephemeral=True)
+
+@bot.tree.command(name="period_search", description="期間を指定して、関心の高いニュースを検索します")
+@app_commands.describe(
+    start_date="開始日 (例: 2024-05-01)",
+    end_date="終了日 (例: 2024-05-07)"
+)
+async def period_search(interaction: discord.Interaction, start_date: str, end_date: str):
+    await interaction.response.defer()
+    
+    # 1. Parse Dates
+    try:
+        # Support common separators
+        s_date = start_date.replace("/", "-").replace(".", "-")
+        e_date = end_date.replace("/", "-").replace(".", "-")
+        dt_start = datetime.datetime.strptime(s_date, "%Y-%m-%d")
+        dt_end = datetime.datetime.strptime(e_date, "%Y-%m-%d")
+        
+        if dt_start > dt_end:
+            await interaction.followup.send("開始日は終了日より前の日付を指定してください。")
+            return
+    except ValueError:
+        await interaction.followup.send("日付の形式が正しくありません。YYYY-MM-DD 形式で入力してください。")
+        return
+
+    # 2. Get high interest genres
+    genre_scores = await bot.get_genre_scores()
+    sorted_genres = sorted(genre_scores.items(), key=lambda x: x[1], reverse=True)
+    top_genres = [g for g, s in sorted_genres[:3]]
+    genre_list = bot.get_genre_list()
+
+    # 3. Web Search
+    # We use the top genres as search keywords. 
+    # DDGS timelimit doesn't support exact ranges, so we search and let Gemini filter.
+    # We'll try to use a broad timelimit if possible, but 'y' (year) or 'm' (month) are the only options for older dates.
+    # If the end_date is recent, we use appropriate timelimit.
+    now = datetime.datetime.now()
+    days_diff = (now - dt_start).days
+    
+    timelimit = None
+    if days_diff <= 1: timelimit = "d"
+    elif days_diff <= 7: timelimit = "w"
+    elif days_diff <= 30: timelimit = "m"
+    else: timelimit = "y"
+
+    search_query = f"{' '.join(top_genres)} ニュース"
+    logger.info(f"Period search for query: {search_query} (Target: {start_date} to {end_date})")
+    
+    raw_results = []
+    try:
+        with DDGS() as ddgs:
+            results = ddgs.text(query=search_query, region="jp-jp", safesearch="on", timelimit=timelimit, max_results=20)
+            raw_results = [{"title": r.get("body"), "url": r.get("href"), "original_title": r.get("title")} for r in results]
+    except Exception as e:
+        logger.error(f"Error in period web search: {e}")
+        await interaction.followup.send("検索中にエラーが発生しました。")
+        return
+
+    if not raw_results:
+        await interaction.followup.send(f"{start_date} から {end_date} の期間に該当するニュースは見つかりませんでした。")
+        return
+
+    # 4. Gemini Selection
+    prompt = f"""
+    あなたはニュース選別アシスタントです。
+    ユーザーが指定した期間【{start_date} から {end_date}】に合致し、かつユーザーの関心が高いジャンル（{', '.join(top_genres)}）に関連する重要なニュースを最大3件選び、日本語で要約してください。
+
+    【条件】
+    1. ニュースの内容やURLから、指定された期間【{start_date} 〜 {end_date}】の出来事である可能性が高いものを優先してください。
+    2. 以下の【利用可能なジャンル】から最も適切なものを【最大3つ】選び、リスト（genres）として含めてください。
+    3. 重複を避け、重要度の高いものを厳選してください。
+
+    【利用可能なジャンル】
+    {genre_list}
+
+    【ニュースリスト】
+    {json.dumps(raw_results, ensure_ascii=False, indent=2)}
+
+    【出力形式】必ず以下のJSON形式のみで返してください。
+    [
+        {{
+            "title": "ニュースタイトル",
+            "url": "URL",
+            "summary": "30〜50文字程度の短い要約",
+            "genres": ["ジャンル1", "ジャンル2"]
+        }},
+        ...
+    ]
+    """
+
+    try:
+        response = await model.generate_content_async(prompt)
+        if not response or not response.text:
+            await interaction.followup.send("AIによる選定に失敗しました。")
+            return
+
+        text = response.text
+        if "```json" in text:
+            text = text.split("```json")[1].split("```")[0].strip()
+        elif "```" in text:
+            text = text.split("```")[1].split("```")[0].strip()
+        
+        selected_items = json.loads(text)
+    except Exception as e:
+        logger.error(f"Error processing Gemini response for period search: {e}")
+        await interaction.followup.send("AIの回答を解析できませんでした。")
+        return
+
+    # 5. Result Display
+    if not selected_items:
+        await interaction.followup.send(f"指定された期間（{start_date}〜{end_date}）に合致する適切なニュースが見つかりませんでした。")
+        return
+
+    await interaction.followup.send(f"📅 **{start_date} 〜 {end_date}** の注目ニュースを表示します（関心ジャンル: {', '.join(top_genres)}）")
+
+    async with aiosqlite.connect(DB_FILE) as db:
+        for item in selected_items:
+            # Save to history
+            await db.execute("INSERT OR IGNORE INTO news_history (url, title) VALUES (?, ?)", (item['url'], item['title']))
+            for g in item.get('genres', []):
+                await db.execute("INSERT OR IGNORE INTO news_genres (url, genre) VALUES (?, ?)", (item['url'], g.strip()))
+            await db.commit()
+
+            embed = discord.Embed(
+                title=item['title'],
+                url=item['url'],
+                description=item['summary'],
+                color=discord.Color.dark_gold()
+            )
+            embed.set_footer(text=f"ジャンル: {', '.join(item.get('genres', []))}")
+            
+            view = RatingView(item['url'])
+            await interaction.followup.send(embed=embed, view=view)
 
 @setup.error
 @test_news.error
