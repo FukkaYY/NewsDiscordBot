@@ -2,21 +2,26 @@
 
 表示するニュースに付与するジャンルの候補リストです。
 
-- 政治 (Politics)
-- 経済 (Economy)
-- 社会 (Society)
-- 国際 (International)
-- テクノロジー (Technology)
-- 科学 (Science)
-- ビジネス (Business)
-- エンタメ (Entertainment)
-- スポーツ (Sports)
-- ライフスタイル (Lifestyle)
-- 健康 (Health)
-- 環境 (Environment)
-- 教育 (Education)
-- ペット (pet)
-- 旅行 (travel)
-- 酒 (sake)
-- 犯罪 (crime)
-- 訃報 (death)
+- 政治
+- 経済
+- 社会
+- 国際
+- テクノロジー
+- 科学
+- ビジネス
+- エンタメ
+- スポーツ
+- ライフスタイル
+- 健康
+- 環境
+- 教育
+- ペット
+- 旅行
+- 酒
+- 犯罪
+- 訃報
+- 趣味
+- ゲーム
+- 芸能
+- 鉄道
+- アニメ
