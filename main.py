@@ -437,7 +437,8 @@ async def genre_search(interaction: discord.Interaction, genre: str):
             SELECT nh.title, nh.url, nh.sent_at
             FROM news_history nh
             JOIN news_genres ng ON nh.url = ng.url
-            WHERE ng.genre = ?
+            WHERE ng.genre = ? 
+              AND nh.sent_at >= datetime('now', '-7 days')
             ORDER BY nh.sent_at DESC
             LIMIT 3
         """
@@ -449,14 +450,38 @@ async def genre_search(interaction: discord.Interaction, genre: str):
     genre_list = bot.get_genre_list()
     try:
         with DDGS() as ddgs:
-            search_query = f"{genre} 最新ニュース"
-            results = ddgs.text(query=search_query, region="jp-jp", safesearch="on", timelimit="d", max_results=10)
-            raw_web_news = [{"title": r.get("body"), "url": r.get("href"), "original_title": r.get("title")} for r in results]
+            search_query = f"{genre}"
+            logger.info(f"Searching news for {genre} with timelimit='w'...")
+            # Use .news() for better freshness and metadata
+            results = ddgs.news(query=search_query, region="jp-jp", safesearch="on", timelimit="w", max_results=10)
+            
+            raw_web_news = []
+            if results:
+                for r in results:
+                    raw_web_news.append({
+                        "title": r.get("title"),
+                        "body": r.get("body"),
+                        "url": r.get("url"),
+                        "source": r.get("source"),
+                        "date": r.get("date")
+                    })
+            
+            # Fallback to .text() if .news() returns nothing
+            if not raw_web_news:
+                logger.info("ddgs.news() returned no results, falling back to ddgs.text()...")
+                results = ddgs.text(query=f"{genre} ニュース", region="jp-jp", safesearch="on", timelimit="w", max_results=10)
+                raw_web_news = [{"title": r.get("body"), "url": r.get("href"), "original_title": r.get("title")} for r in results]
 
         if raw_web_news:
             prompt = f"""
             あなたはニュース選別アシスタントです。
-            以下のニュースリストから、ジャンル「{genre}」に最も合致する重要なニュースを最大3件選び、日本語で要約してください。
+            以下のニュースリストから、ジャンル「{genre}」に最も合致する【最新の重要なニュース】を最大3件選び、日本語で要約してください。
+            
+            【選定基準】
+            1. 可能な限り「今日」または「数日前」の新しいニュースを優先してください。
+            2. ジャンル「{genre}」との関連性が高いものを選んでください。
+            3. 内容が重複している場合は、最も詳しいもの1つに絞ってください。
+
             また、各ニュースに対して、以下の【利用可能なジャンル】から最も適切なものを【最大3つ】選び、リスト（genres）として含めてください。
             
             【利用可能なジャンル】
