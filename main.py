@@ -27,7 +27,6 @@ MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3.5-flash")
 
 # Initialize Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel(model_name=MODEL_NAME)
 
 
 # Database file
@@ -84,6 +83,31 @@ class NewsBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         super().__init__(command_prefix="!", intents=intents)
+        self.available_models = []
+        self.current_model_name = MODEL_NAME
+        self.model = genai.GenerativeModel(model_name=MODEL_NAME)
+
+    def load_available_models(self):
+        try:
+            if os.path.exists("models.md"):
+                with open("models.md", "r", encoding="utf-8") as f:
+                    self.available_models = [line.strip() for line in f if line.strip()]
+            else:
+                self.available_models = [MODEL_NAME]
+                with open("models.md", "w", encoding="utf-8") as f:
+                    f.write(MODEL_NAME + "\n")
+        except Exception as e:
+            logger.error(f"Error loading models.md: {e}")
+            self.available_models = [MODEL_NAME]
+
+    async def load_active_model(self):
+        async with aiosqlite.connect(DB_FILE) as db:
+            async with db.execute("SELECT setting_value FROM system_settings WHERE setting_key = 'active_model'") as cursor:
+                row = await cursor.fetchone()
+                if row:
+                    self.current_model_name = row[0]
+                    self.model = genai.GenerativeModel(model_name=self.current_model_name)
+                    logger.info(f"Loaded active model from DB: {self.current_model_name}")
 
     async def setup_hook(self):
         # Initialize Database
@@ -92,6 +116,12 @@ class NewsBot(commands.Bot):
                 CREATE TABLE IF NOT EXISTS config (
                     guild_id INTEGER PRIMARY KEY,
                     channel_id INTEGER
+                )
+            """)
+            await db.execute("""
+                CREATE TABLE IF NOT EXISTS system_settings (
+                    setting_key TEXT PRIMARY KEY,
+                    setting_value TEXT
                 )
             """)
             await db.execute("""
@@ -119,6 +149,9 @@ class NewsBot(commands.Bot):
                 )
             """)
             await db.commit()
+        
+        self.load_available_models()
+        await self.load_active_model()
         
         # Sync slash commands
         await self.tree.sync()
@@ -340,7 +373,7 @@ class NewsBot(commands.Bot):
         """
         
         try:
-            response = await model.generate_content_async(prompt)
+            response = await self.model.generate_content_async(prompt)
             if not response or not response.text:
                 logger.error("Gemini returned an empty response.")
                 return []
@@ -425,6 +458,57 @@ async def interest(interaction: discord.Interaction):
     
     await interaction.followup.send(embed=embed, ephemeral=True)
 
+# --- Model Management Commands ---
+model_group = app_commands.Group(name="model", description="AIモデルの管理を行います")
+
+@model_group.command(name="status", description="現在使用中のAIモデルを表示します")
+async def model_status(interaction: discord.Interaction):
+    await interaction.response.send_message(f"現在使用中のモデル: `{bot.current_model_name}`", ephemeral=True)
+
+@model_group.command(name="list", description="利用可能なAIモデルの一覧を表示します")
+async def model_list(interaction: discord.Interaction):
+    models_str = "\n".join([f"- {m}" for m in bot.available_models])
+    await interaction.response.send_message(f"**利用可能なモデル一覧:**\n{models_str}", ephemeral=True)
+
+@model_group.command(name="set", description="使用するAIモデルを切り替えます")
+@app_commands.describe(model_name="切り替え先のモデル名")
+async def model_set(interaction: discord.Interaction, model_name: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("このコマンドは管理者のみ実行可能です。", ephemeral=True)
+        return
+
+    if model_name not in bot.available_models:
+        await interaction.response.send_message(f"エラー: `{model_name}` は利用可能なモデルリストにありません。", ephemeral=True)
+        return
+
+    try:
+        # Update bot instance
+        bot.current_model_name = model_name
+        bot.model = genai.GenerativeModel(model_name=model_name)
+        
+        # Save to DB
+        async with aiosqlite.connect(DB_FILE) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO system_settings (setting_key, setting_value) VALUES (?, ?)",
+                ("active_model", model_name)
+            )
+            await db.commit()
+        
+        await interaction.response.send_message(f"AIモデルを `{model_name}` に切り替えました。", ephemeral=True)
+        logger.info(f"Model switched to {model_name} by {interaction.user}")
+    except Exception as e:
+        logger.error(f"Error switching model: {e}")
+        await interaction.response.send_message(f"モデルの切り替え中にエラーが発生しました: {e}", ephemeral=True)
+
+@model_set.autocomplete("model_name")
+async def model_name_autocomplete(interaction: discord.Interaction, current: str) -> List[app_commands.Choice[str]]:
+    return [
+        app_commands.Choice(name=m, value=m)
+        for m in bot.available_models if current.lower() in m.lower()
+    ][:25]
+
+bot.tree.add_command(model_group)
+
 @bot.tree.command(name="genre_search", description="ジャンルを指定してニュースを検索します")
 @app_commands.describe(genre="検索したいジャンル")
 async def genre_search(interaction: discord.Interaction, genre: str):
@@ -501,7 +585,7 @@ async def genre_search(interaction: discord.Interaction, genre: str):
                 ...
             ]
             """
-            response = await model.generate_content_async(prompt)
+            response = await bot.model.generate_content_async(prompt)
             if response and response.text:
                 text = response.text
                 if "```json" in text:
@@ -693,7 +777,8 @@ async def period_search(interaction: discord.Interaction, start_date: str, end_d
     """
 
     try:
-        response = await model.generate_content_async(prompt)
+        response = await bot.model.generate_content_async(prompt)
+
         if not response or not response.text:
             await interaction.followup.send("AIによる選定に失敗しました。")
             return
