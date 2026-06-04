@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import google.generativeai as genai
 import aiosqlite
 import aiohttp
+import xml.etree.ElementTree as ET
 from ddgs import DDGS
 
 # Setup logging
@@ -278,44 +279,48 @@ class NewsBot(commands.Bot):
     def bot_get_channel(self, channel_id):
         return self.get_channel(channel_id)
 
+    async def fetch_google_news_rss(self) -> List[Dict[str, Any]]:
+        url = "https://news.google.com/rss?hl=ja&gl=JP&ceid=JP:ja"
+        raw_news = []
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    if response.status != 200:
+                        logger.error(f"Failed to fetch Google News RSS: {response.status}")
+                        return []
+                    xml_data = await response.text()
+            
+            root = ET.fromstring(xml_data)
+            items = root.findall(".//item")
+            
+            for item in items[:40]:
+                title = item.find("title").text if item.find("title") is not None else ""
+                link = item.find("link").text if item.find("link") is not None else ""
+                pub_date = item.find("pubDate").text if item.find("pubDate") is not None else ""
+                description = item.find("description").text if item.find("description") is not None else ""
+                
+                raw_news.append({
+                    "title": title,
+                    "body": description,
+                    "url": link,
+                    "source": "Google News RSS",
+                    "date": pub_date
+                })
+        except Exception as e:
+            logger.error(f"Error fetching Google News RSS: {e}")
+        
+        return raw_news
+
     async def fetch_news_with_gemini(self, genre_scores: Dict[str, float] = None) -> List[Dict[str, Any]]:
         today = datetime.datetime.now(ZoneInfo("Asia/Tokyo")).strftime("%Y年%m月%d日")
         genre_list = self.get_genre_list()
         
-        # Step 1: Fetch news using DDGS
-        logger.info("Fetching news from DuckDuckGo...")
-        raw_news = []
-        try:
-            with DDGS() as ddgs:
-                # Try .news() first
-                try:
-                    results = ddgs.news(query="最新ニュース", region="jp-jp", safesearch="on", timelimit="w", max_results=20)
-                    for r in results:
-                        raw_news.append({
-                            "title": r.get("title"),
-                            "body": r.get("body"),
-                            "url": r.get("url"),
-                            "source": r.get("source"),
-                            "date": r.get("date")
-                        })
-                except Exception as ne:
-                    logger.warning(f"DDGS .news() failed, trying .text(): {ne}")
-                    # Fallback to .text() if .news() is rate-limited or fails
-                    results = ddgs.text(query="最新ニュース", region="jp-jp", safesearch="on", timelimit="w", max_results=20)
-                    for r in results:
-                        raw_news.append({
-                            "title": r.get("title"),
-                            "body": r.get("body"),
-                            "url": r.get("href"),
-                            "source": "Search Result",
-                            "date": today
-                        })
-        except Exception as e:
-            logger.error(f"Error fetching from DuckDuckGo: {e}")
-            return []
+        # Step 1: Fetch news using Google News RSS
+        logger.info("Fetching news from Google News RSS...")
+        raw_news = await self.fetch_google_news_rss()
 
         if not raw_news:
-            logger.warning("No news found from DuckDuckGo.")
+            logger.warning("No news found from Google News RSS.")
             return []
 
         # Step 2 & 3: Selection and Summarization with Gemini
@@ -359,12 +364,13 @@ class NewsBot(commands.Bot):
         2. {"高関心ジャンル（" + ", ".join(high_interest_genres) + "）から【3件】、それ以外から【2件】選んでください。" if high_interest_genres else "バランスよく5件選んでください。"}
         3. 各ニュースについて、30〜50文字程度の短い要約（summary）を作成してください。
         4. 各ニュースに対し、上記の【利用可能なジャンル】から最も適切なものを【最大3つ】選び、リスト（genres）として含めてください。
-        5. 出力は必ず以下のJSON形式のみで返してください。
+        5. 【重要】URLは必ず【ニュースリスト】にある元のURLをそのまま使用してください。勝手に生成したり、省略したりしないでください。
+        6. 出力は必ず以下のJSON形式のみで返してください。
         
         [
             {{
                 "title": "ニュースタイトル", 
-                "url": "URL", 
+                "url": "元のニュースのURL", 
                 "summary": "短い要約",
                 "genres": ["ジャンル1", "ジャンル2"]
             }},
@@ -574,11 +580,14 @@ async def genre_search(interaction: discord.Interaction, genre: str):
             【ニュースリスト】
             {json.dumps(raw_web_news, ensure_ascii=False, indent=2)}
             
+            【条件】
+            1. URLは必ず【ニュースリスト】にある元のURLをそのまま使用してください。勝手に生成しないでください。
+
             【出力形式】必ず以下のJSON形式で返してください。
             [
                 {{
                     "title": "ニュースタイトル",
-                    "url": "URL",
+                    "url": "元のニュースのURL",
                     "summary": "短い要約",
                     "genres": ["ジャンル1", "ジャンル2"]
                 }},
@@ -757,6 +766,7 @@ async def period_search(interaction: discord.Interaction, start_date: str, end_d
     1. ニュースの内容やURLから、指定された期間【{start_date} 〜 {end_date}】の出来事である可能性が高いものを優先してください。
     2. 以下の【利用可能なジャンル】から最も適切なものを【最大3つ】選び、リスト（genres）として含めてください。
     3. 重複を避け、重要度の高いものを厳選してください。
+    4. URLは必ず【ニュースリスト】にある元のURLをそのまま使用してください。勝手に生成しないでください。
 
     【利用可能なジャンル】
     {genre_list}
@@ -768,7 +778,7 @@ async def period_search(interaction: discord.Interaction, start_date: str, end_d
     [
         {{
             "title": "ニュースタイトル",
-            "url": "URL",
+            "url": "元のニュースのURL",
             "summary": "30〜50文字程度の短い要約",
             "genres": ["ジャンル1", "ジャンル2"]
         }},
