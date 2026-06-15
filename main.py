@@ -1,6 +1,7 @@
 import os
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import datetime
 import json
 from zoneinfo import ZoneInfo
@@ -17,7 +18,19 @@ import xml.etree.ElementTree as ET
 from ddgs import DDGS
 
 # Setup logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+console_handler = logging.StreamHandler()
+console_handler.setFormatter(log_formatter)
+
+# Save logs to bot.log, max size 1MB, backup count 3
+file_handler = RotatingFileHandler('bot.log', maxBytes=1024*1024, backupCount=3, encoding='utf-8')
+file_handler.setFormatter(log_formatter)
+
+logging.basicConfig(
+    level=logging.INFO,
+    handlers=[console_handler, file_handler]
+)
 logger = logging.getLogger(__name__)
 
 # Load environment variables
@@ -831,8 +844,61 @@ async def period_search(interaction: discord.Interaction, start_date: str, end_d
             view = RatingView(item['url'])
             await interaction.followup.send(embed=embed, view=view)
 
+@bot.tree.command(name="logs", description="Botの動作ログを確認します（管理者のみ）")
+@app_commands.checks.has_permissions(administrator=True)
+@app_commands.describe(
+    lines="表示する直近のログ行数（デフォルト20、最大100）",
+    download="ログファイルをダウンロードする場合はTrue（デフォルトFalse）"
+)
+async def get_logs(interaction: discord.Interaction, lines: int = 20, download: bool = False):
+    await interaction.response.defer(ephemeral=True)
+    
+    if lines <= 0:
+        lines = 20
+    elif lines > 100:
+        lines = 100
+        
+    log_file = "bot.log"
+    
+    if not os.path.exists(log_file):
+        await interaction.followup.send("ログファイルが見つかりません。", ephemeral=True)
+        return
+
+    if download:
+        try:
+            file = discord.File(log_file, filename="bot.log")
+            await interaction.followup.send("現在のログファイルです：", file=file, ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error sending log file: {e}")
+            await interaction.followup.send(f"ログファイルの送信中にエラーが発生しました: {e}", ephemeral=True)
+    else:
+        try:
+            with open(log_file, "r", encoding="utf-8") as f:
+                all_lines = f.readlines()
+            
+            recent_lines = all_lines[-lines:]
+            log_content = "".join(recent_lines)
+            
+            # Discord has a 2000 character limit. Keep it well under that limit.
+            code_block_header = "```log\n"
+            code_block_footer = "\n```"
+            max_char = 1900
+            
+            if len(log_content) > max_char:
+                log_content = log_content[-max_char:]
+                lines_list = log_content.splitlines()
+                if len(lines_list) > 1:
+                    log_content = "\n".join(lines_list[1:]) + "\n(文字数制限のため、一部省略しました)"
+            
+            msg = f"直近の動作ログ（{len(recent_lines)}行分）です：\n{code_block_header}{log_content}{code_block_footer}"
+            await interaction.followup.send(msg, ephemeral=True)
+        except Exception as e:
+            logger.error(f"Error reading log file: {e}")
+            await interaction.followup.send(f"ログファイルの読み込み中にエラーが発生しました: {e}", ephemeral=True)
+
 @setup.error
 @test_news.error
+@get_logs.error
 async def admin_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.MissingPermissions):
         await interaction.response.send_message("このコマンドを実行するには管理者権限が必要です。", ephemeral=True)
